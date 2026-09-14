@@ -8,11 +8,11 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "GitHub Release tag to create, e.g. portable-v0.1.0"
+        description: "GitHub Release tag, e.g. portable-v0.1.0"
         required: true
         type: string
       prerelease:
-        description: "Mark this release as a prerelease"
+        description: "Mark as prerelease"
         required: true
         default: false
         type: boolean
@@ -20,55 +20,50 @@ on:
 permissions:
   contents: write
 
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  IS_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+
 jobs:
-  build-windows:
-    name: Windows x64 portable CLI
+  windows-x64:
+    name: Windows x64
     runs-on: windows-2022
 
     env:
       TARGET: x86_64-pc-windows-msvc
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
-      IS_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
 
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.4.0"
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.88.0
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Prepare FFmpeg and native dependencies
+      - name: Prepare native dependencies
         shell: pwsh
         run: bun scripts/setup.js
         env:
           RUST_TARGET_TRIPLE: x86_64-pc-windows-msvc
 
-      - name: Build Cap CLI
+      - name: Build CLI
         shell: pwsh
         run: cargo build --release -p cap --target $env:TARGET
 
-      - name: Assemble portable ZIP
+      - name: Assemble portable package
         shell: pwsh
         run: |
           $out = "dist\cap-portable-windows-x64"
-
           New-Item -ItemType Directory -Force -Path $out | Out-Null
 
-          # The executable is target-specific.
           Copy-Item "target\$env:TARGET\release\cap.exe" "$out\cap.exe" -Force
 
-          # Cap's setup script stages FFmpeg's runtime files here.
           Get-ChildItem "target\release" -Filter "*.dll" |
             Copy-Item -Destination $out -Force
 
-          # Include any additional runtime DLLs Cargo generated beside cap.exe.
           Get-ChildItem "target\$env:TARGET\release" -Filter "*.dll" |
             Copy-Item -Destination $out -Force
 
@@ -85,34 +80,271 @@ jobs:
 
           foreach ($dll in $requiredDlls) {
             if (-not (Test-Path "$out\$dll")) {
-              throw "Portable package is missing required DLL: $dll"
+              throw "Missing required DLL: $dll"
             }
           }
 
           @"
-          Cap Portable CLI for Windows x64
+          Cap Portable CLI - Windows x64
 
-          No installation is required. Keep cap.exe and every DLL in this
-          folder together.
+          Keep cap.exe and all DLL files in this folder.
 
-          Examples:
+          Example:
             cap.exe targets --json
-            cap.exe record start --screen <id> --system-audio --detach --json
-            cap.exe record stop --id <recordingId> --json
-            cap.exe export <recording.cap> --output output.mp4 --json
           "@ | Set-Content "$out\README.txt"
 
-          Compress-Archive `
-            -Path "$out\*" `
+          Compress-Archive -Path "$out\*" `
             -DestinationPath "dist\cap-portable-windows-x64.zip" `
             -Force
 
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: cap-portable-windows-x64
           path: dist/cap-portable-windows-x64.zip
           if-no-files-found: error
+
+  linux-x64:
+    name: Linux x64
+    runs-on: ubuntu-22.04
+
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install build dependencies
+        uses: ./.github/actions/install-desktop-deps
+
+      - name: Prepare native dependencies
+        run: bun scripts/setup.js
+        env:
+          RUST_TARGET_TRIPLE: x86_64-unknown-linux-gnu
+
+      - name: Build CLI
+        run: cargo build --release -p cap --target "$TARGET"
+
+      - name: Assemble portable package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="dist/cap-portable-linux-x64"
+          mkdir -p "$OUT/bin" "$OUT/lib"
+
+          cp "target/$TARGET/release/cap" "$OUT/bin/cap"
+          chmod +x "$OUT/bin/cap"
+
+          # FFmpeg and other bundled native libraries.
+          cp -a target/native-deps/lib/. "$OUT/lib/" 2>/dev/null || true
+          find "target/$TARGET/release" -maxdepth 1 -type f -name '*.so*' \
+            -exec cp -a {} "$OUT/lib/" \;
+
+          cat > "$OUT/run-cap.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$ROOT/bin/cap" "$@"
+          EOF
+
+          chmod +x "$OUT/run-cap.sh"
+
+          cat > "$OUT/README.txt" <<'EOF'
+          Cap Portable CLI - Linux x64
+
+          Run it through:
+            ./run-cap.sh targets --json
+
+          This package bundles Cap's FFmpeg libraries. Your Linux system still
+          needs normal desktop/capture requirements such as PipeWire or X11.
+          EOF
+
+          (
+            cd dist
+            zip -r cap-portable-linux-x64.zip cap-portable-linux-x64
+          )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cap-portable-linux-x64
+          path: dist/cap-portable-linux-x64.zip
+          if-no-files-found: error
+
+  macos-intel:
+    name: macOS Intel
+    runs-on: macos-15-intel
+
+    env:
+      TARGET: x86_64-apple-darwin
+      ARCH_LABEL: macos-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Prepare native dependencies
+        run: bun scripts/setup.js
+        env:
+          RUST_TARGET_TRIPLE: x86_64-apple-darwin
+
+      - name: Build CLI
+        run: cargo build --release -p cap --target "$TARGET"
+
+      - name: Assemble portable package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="dist/cap-portable-${ARCH_LABEL}"
+          mkdir -p "$OUT"
+
+          cp "target/$TARGET/release/cap" "$OUT/cap"
+          cp -R "target/Frameworks" "$OUT/Frameworks"
+
+          cat > "$OUT/run-cap.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export DYLD_FRAMEWORK_PATH="$ROOT/Frameworks"
+          exec "$ROOT/cap" "$@"
+          EOF
+
+          chmod +x "$OUT/cap" "$OUT/run-cap.sh"
+
+          find "$OUT/Frameworks" -type f \( -name "*.dylib" -o -perm +111 \) \
+            -exec codesign --force --sign - {} \;
+
+          codesign --force --sign - "$OUT/cap"
+
+          cat > "$OUT/README.txt" <<'EOF'
+          Cap Portable CLI - macOS
+
+          Run it through:
+            ./run-cap.sh targets --json
+
+          This is ad-hoc signed, not notarized. If macOS marks the downloaded
+          ZIP as quarantined, extract it and run:
+            xattr -dr com.apple.quarantine cap-portable-macos-*
+          EOF
+
+          (
+            cd dist
+            zip -r "cap-portable-${ARCH_LABEL}.zip" "cap-portable-${ARCH_LABEL}"
+          )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cap-portable-macos-x64
+          path: dist/cap-portable-macos-x64.zip
+          if-no-files-found: error
+
+  macos-arm64:
+    name: macOS Apple Silicon
+    runs-on: macos-15
+
+    env:
+      TARGET: aarch64-apple-darwin
+      ARCH_LABEL: macos-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Prepare native dependencies
+        run: bun scripts/setup.js
+        env:
+          RUST_TARGET_TRIPLE: aarch64-apple-darwin
+
+      - name: Build CLI
+        run: cargo build --release -p cap --target "$TARGET"
+
+      - name: Assemble portable package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="dist/cap-portable-${ARCH_LABEL}"
+          mkdir -p "$OUT"
+
+          cp "target/$TARGET/release/cap" "$OUT/cap"
+          cp -R "target/Frameworks" "$OUT/Frameworks"
+
+          cat > "$OUT/run-cap.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export DYLD_FRAMEWORK_PATH="$ROOT/Frameworks"
+          exec "$ROOT/cap" "$@"
+          EOF
+
+          chmod +x "$OUT/cap" "$OUT/run-cap.sh"
+
+          find "$OUT/Frameworks" -type f \( -name "*.dylib" -o -perm +111 \) \
+            -exec codesign --force --sign - {} \;
+
+          codesign --force --sign - "$OUT/cap"
+
+          cat > "$OUT/README.txt" <<'EOF'
+          Cap Portable CLI - macOS Apple Silicon
+
+          Run it through:
+            ./run-cap.sh targets --json
+
+          This is ad-hoc signed, not notarized. If macOS marks the downloaded
+          ZIP as quarantined, extract it and run:
+            xattr -dr com.apple.quarantine cap-portable-macos-*
+          EOF
+
+          (
+            cd dist
+            zip -r "cap-portable-${ARCH_LABEL}.zip" "cap-portable-${ARCH_LABEL}"
+          )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cap-portable-macos-arm64
+          path: dist/cap-portable-macos-arm64.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs:
+      - windows-x64
+      - linux-x64
+      - macos-intel
+      - macos-arm64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download portable builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cap-portable-*
+          path: release-assets
+          merge-multiple: true
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -123,4 +355,4 @@ jobs:
           draft: false
           prerelease: ${{ env.IS_PRERELEASE }}
           generate_release_notes: true
-          files: dist/cap-portable-windows-x64.zip
+          files: release-assets/*.zip
